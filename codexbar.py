@@ -371,6 +371,34 @@ def _claude_cred_paths():
     return paths
 
 
+def _manual_session_key():
+    """A user-supplied claude.ai sessionKey, used verbatim as a cookie.
+
+    Bypasses browser cookie decryption entirely — necessary because current
+    Chrome/Edge use App-Bound Encryption (v20 cookies) that the DPAPI/AES-GCM
+    decryptor cannot read. Sources, in order:
+      1. env var CODEXBAR_SESSION_KEY
+      2. sessionkey.txt next to the .exe / script
+      3. ~/.codexbar/sessionkey.txt
+    """
+    v = os.environ.get("CODEXBAR_SESSION_KEY")
+    if v and v.strip():
+        return v.strip()
+    if getattr(sys, "frozen", False):
+        here = Path(sys.executable).parent
+    else:
+        here = Path(__file__).resolve().parent
+    for p in (here / "sessionkey.txt", Path.home() / ".codexbar" / "sessionkey.txt"):
+        try:
+            if p.exists():
+                t = p.read_text(encoding="utf-8").strip()
+                if t:
+                    return t
+        except OSError:
+            continue
+    return None
+
+
 class ClaudeDataFetcher:
     def __init__(self):
         self.data = self._empty()
@@ -687,8 +715,15 @@ class ClaudeDataFetcher:
     # ── cookie-based API fetcher ────────────────
 
     def _fetch_cookie_api(self):
-        """Read sessionKey from browser cookies, call Claude API."""
-        session_key, browser = _CookieDecryptor.get_session_key()
+        """Call the Claude API with a sessionKey.
+
+        Prefers a user-supplied key (env/sessionkey.txt) so it works even
+        when the browser uses App-Bound Encryption; otherwise falls back to
+        decrypting the browser cookie (older v10 Chrome/Edge/Brave only)."""
+        session_key = _manual_session_key()
+        browser = "manual (sessionkey.txt)"
+        if not session_key:
+            session_key, browser = _CookieDecryptor.get_session_key()
         if not session_key:
             return None
         print(f"    Got sessionKey from {browser} ({len(session_key)} chars)")
