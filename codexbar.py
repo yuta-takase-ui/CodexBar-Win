@@ -332,6 +332,45 @@ class _CookieDecryptor:
 # Data fetcher
 # ─────────────────────────────────────────────
 
+# ── Claude-only mode + WSL credential bridge (fork customization) ──
+CLAUDE_ONLY = True   # this fork shows Claude usage only; set False to restore OpenAI/Codex
+
+
+def _wsl_claude_dirs():
+    """On Windows, locate Claude Code's ~/.claude inside any WSL distro.
+
+    WSL filesystems are reachable from Windows at \\\\wsl$\\<distro>\\... .
+    Claude Code running *inside* WSL stores its token there, which the
+    native-Windows lookup (Path.home()) never sees. Returns .claude dirs.
+    """
+    out = []
+    if os.name != "nt":
+        return out
+    for root in (r"\\wsl$", r"\\wsl.localhost"):
+        base = Path(root)
+        try:
+            if not base.exists():
+                continue
+            for distro in base.iterdir():
+                home = distro / "home"
+                if not home.exists():
+                    continue
+                for userdir in home.iterdir():
+                    cdir = userdir / ".claude"
+                    if cdir.exists():
+                        out.append(cdir)
+        except OSError:
+            continue
+    return out
+
+
+def _claude_cred_paths():
+    """Candidate .credentials.json paths: native Windows first, then WSL."""
+    paths = [Path.home() / ".claude" / ".credentials.json"]
+    paths += [d / ".credentials.json" for d in _wsl_claude_dirs()]
+    return paths
+
+
 class ClaudeDataFetcher:
     def __init__(self):
         self.data = self._empty()
@@ -352,6 +391,8 @@ class ClaudeDataFetcher:
         """Check if Claude Code is installed (CLI in PATH or ~/.claude exists)."""
         claude_dir = Path.home() / ".claude"
         if claude_dir.exists():
+            return True
+        if _wsl_claude_dirs():            # Claude Code installed inside WSL
             return True
         if self._find_claude():
             return True
@@ -610,12 +651,14 @@ class ClaudeDataFetcher:
     _CREDS_PATH = Path.home() / ".claude" / ".credentials.json"
 
     def _fetch_oauth_api(self):
-        """Read the OAuth access token that Claude Code stores locally,
-        then call the Claude.ai API to get live usage data."""
-        if not self._CREDS_PATH.exists():
+        """Read the OAuth access token that Claude Code stores locally —
+        native Windows (~/.claude) or inside a WSL distro — then call the
+        Claude.ai API to get live usage data."""
+        creds_path = next((p for p in _claude_cred_paths() if p.exists()), None)
+        if creds_path is None:
             return None
         try:
-            with open(self._CREDS_PATH, "r", encoding="utf-8") as f:
+            with open(creds_path, "r", encoding="utf-8") as f:
                 creds = json.load(f)
             oauth = creds.get("claudeAiOauth") or {}
             token = oauth.get("accessToken")
@@ -626,7 +669,7 @@ class ClaudeDataFetcher:
             tier = oauth.get("rateLimitTier") or oauth.get("subscriptionType") or ""
             plan_local = tier.replace("default_claude_", "").replace("_", " ").title() or "Pro"
 
-            print(f"    OAuth token found ({len(token)} chars), plan hint: {plan_local}")
+            print(f"    OAuth token found ({len(token)} chars) at {creds_path}, plan hint: {plan_local}")
         except Exception as e:
             print(f"    OAuth creds err: {e}")
             return None
@@ -1464,7 +1507,8 @@ class CodexBarPopup(ctk.CTkToplevel):
             hover_color=self.CL_HOVER,
             corner_radius=8, height=26, width=34,
             command=lambda: self._switch_tab("openai"))
-        self._oa_tab_btn.pack(side="left", padx=(1, 2), pady=2)
+        if not CLAUDE_ONLY:            # hidden in Claude-only fork (button still exists)
+            self._oa_tab_btn.pack(side="left", padx=(1, 2), pady=2)
 
         # ── CLAUDE CONTENT ──
         self._claude_frame = ctk.CTkFrame(self, fg_color=self.CL_BG, corner_radius=0)
@@ -1834,12 +1878,15 @@ class CodexBarApp:
         print("[CodexBar] Fetching your real usage data...\n")
         self.fetcher.fetch_all()
         print(f"\n[CodexBar] Source: {self.fetcher.data['source']}")
-        try:
-            self.codex_data = self.codex_fetcher.fetch()
-            print(f"[CodexBar] Codex: {'available' if self.codex_data.get('available') else 'not found'}")
-        except Exception as e:
-            print(f"[CodexBar] Codex fetch err: {e}")
+        if CLAUDE_ONLY:
             self.codex_data = CodexDataFetcher._empty()
+        else:
+            try:
+                self.codex_data = self.codex_fetcher.fetch()
+                print(f"[CodexBar] Codex: {'available' if self.codex_data.get('available') else 'not found'}")
+            except Exception as e:
+                print(f"[CodexBar] Codex fetch err: {e}")
+                self.codex_data = CodexDataFetcher._empty()
 
         # ── hidden tkinter root ──
         ctk.set_appearance_mode("light")
@@ -1922,10 +1969,11 @@ class CodexBarApp:
     def _do_refresh(self):
         def bg():
             self.fetcher.fetch_all()
-            try:
-                self.codex_data = self.codex_fetcher.fetch()
-            except Exception:
-                pass
+            if not CLAUDE_ONLY:
+                try:
+                    self.codex_data = self.codex_fetcher.fetch()
+                except Exception:
+                    pass
             d = self.fetcher.data
             self.tray.icon = make_icon(
                 (100 - d["session_used_pct"]) / 100,
